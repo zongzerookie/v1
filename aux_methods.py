@@ -1,5 +1,3 @@
-# aux_methods.py (最终修正版：修复深度融合Query来源 + 验证集维度错误)
-
 from transformers import RobertaForSequenceClassification, AdamW, BertConfig, BertTokenizer, BertPreTrainedModel, \
     BertModel, BertForMultipleChoice, RobertaForMultipleChoice, RobertaTokenizer, RobertaModel
 from transformers import get_linear_schedule_with_warmup
@@ -38,7 +36,7 @@ except ImportError:
 # --- MODIFICATION END ---
 
 # -----------------------------------------------------------------
-# 辅助函数
+# 辅助函数 (新增与通用)
 # -----------------------------------------------------------------
 
 def load_ocr_data(ocr_json_data, image_path_key, img_width, img_height):
@@ -106,11 +104,12 @@ def get_rois(img_path, vectors):
         image = Image.open(img_path)
     except:
         image = Image.new('RGB', (224, 224))
+    img_width, img_height = image.size
     if image.mode != 'RGB': image = image.convert('RGB')
     rois = []
-    if len(vectors) == 0: vectors = [[0, 0, 224, 224]]
+    if len(vectors) == 0: vectors = [[0, 0, img_width, img_height]]
     for vector in vectors:
-        if len(vector) < 4 or vector[0] >= vector[2] or vector[1] >= vector[3]: vector = [0, 0, 224, 224]
+        if len(vector) < 4 or vector[0] >= vector[2] or vector[1] >= vector[3]: vector = [0, 0, img_width, img_height]
         roi_image = image.crop(vector)
         roi_image = roi_image.resize((224, 224), Image.ANTIALIAS)
         roi_image = np.array(roi_image)
@@ -358,17 +357,15 @@ class SpatiallyAwareISAAQ(nn.Module):
 
         flat_input_ids = input_ids.view(-1, input_ids.size(-1))
         flat_mask = attention_mask.view(-1, attention_mask.size(-1))
+        flat_token_type = token_type_ids.view(-1, token_type_ids.size(-1))  # 接收 token_type_ids
 
-        # RoBERTa 编码
         roberta_out = self.roberta(flat_input_ids, attention_mask=flat_mask)
-        sequence_output = roberta_out[0]  # [BS*4, Seq, 1024]
-        # pooled_output = roberta_out[1] # 原错误: 直接使用原始 pooled_output
+        sequence_output = roberta_out[0]
 
         logits_list = []
         current_idx = 0
 
         for b in range(batch_size):
-            # 1. 准备视觉节点
             vis_nodes = self._prepare_visual_nodes(
                 images[b],
                 obj_coords_list[b],
@@ -383,67 +380,78 @@ class SpatiallyAwareISAAQ(nn.Module):
             for c in range(num_choices):
                 seq_emb = sequence_output[current_idx]
                 curr_input_ids = flat_input_ids[current_idx]
+                curr_token_types = flat_token_type[current_idx]  # 使用 token_type_ids
 
-                # 2. 手动提取文本节点 ([CLS], Question, Option)
+                # --- 修复：使用 token_type_ids (0=Para/Q, 1=Opt) ---
+                # (假设 RoBERTa 的 token_type_ids 在 Para/Q 为 0, Opt 为 1)
+                # (如果 RoBERTa 全为0, 则需要用 SEP 索引)
+
+                # --- Fallback: 使用 SEP 索引 (更可靠) ---
                 sep_indices = (curr_input_ids == 2).nonzero(as_tuple=True)[0]
 
-                # --- 修正：包含 [CLS] 节点 ---
-                # [CLS] 是第一个 token (index 0)
-                cls_token = seq_emb[0:1]
+                cls_token = seq_emb[0:1]  # [1, 1024]
                 cls_node = self.txt_projection(cls_token)
-                cls_node = cls_node + self.type_embeddings(torch.tensor(1, device=device))  # CLS 视为 Question 类型或通用文本
+                cls_node = cls_node + self.type_embeddings(torch.tensor(1, device=device))  # CLS 视为 Type 1
 
                 text_nodes = [cls_node]
 
                 if len(sep_indices) >= 3:
-                    # 结构: [CLS] ... [SEP] ... [SEP] Q [SEP] Opt [SEP]
-                    opt_end = sep_indices[-1]
-                    q_end = sep_indices[-2]
-                    q_start = sep_indices[-3]
+                    # [CLS] Para [SEP] [SEP] Q [SEP] Opt [SEP]
+                    opt_end_idx = sep_indices[-1]
+                    q_end_idx = sep_indices[-2]
+                    q_start_idx = sep_indices[-3]
 
-                    q_tokens = seq_emb[q_start + 1: q_end]
+                    q_tokens = seq_emb[q_start_idx + 1: q_end_idx]
                     if len(q_tokens) > 0:
                         q_nodes = self.txt_projection(q_tokens)
-                        q_nodes += self.type_embeddings(torch.tensor(1, device=device))
+                        q_nodes += self.type_embeddings(torch.tensor(1, device=device))  # Type 1
                         text_nodes.append(q_nodes)
 
-                    opt_tokens = seq_emb[q_end + 1: opt_end]
+                    opt_tokens = seq_emb[q_end_idx + 1: opt_end_idx]
                     if len(opt_tokens) > 0:
                         opt_nodes = self.txt_projection(opt_tokens)
-                        opt_nodes += self.type_embeddings(torch.tensor(2, device=device))
+                        opt_nodes += self.type_embeddings(torch.tensor(2, device=device))  # Type 2
                         text_nodes.append(opt_nodes)
                 else:
-                    # Fallback: 如果找不到分隔符，使用除 CLS 外的全部
-                    fallback_tokens = seq_emb[1:]
-                    if len(fallback_tokens) > 0:
-                        fallback_nodes = self.txt_projection(fallback_tokens)
-                        fallback_nodes += self.type_embeddings(torch.tensor(1, device=device))
-                        text_nodes.append(fallback_nodes)
+                    # Fallback (e.g. no Para: [CLS] Q [SEP] Opt [SEP])
+                    if len(sep_indices) == 2:
+                        opt_end_idx = sep_indices[-1]
+                        q_end_idx = sep_indices[-2]
+                        q_start_idx = 0  # CLS
+
+                        q_tokens = seq_emb[q_start_idx + 1: q_end_idx]  # Q
+                        if len(q_tokens) > 0:
+                            q_nodes = self.txt_projection(q_tokens)
+                            q_nodes += self.type_embeddings(torch.tensor(1, device=device))
+                            text_nodes.append(q_nodes)
+
+                        opt_tokens = seq_emb[q_end_idx + 1: opt_end_idx]  # Opt
+                        if len(opt_tokens) > 0:
+                            opt_nodes = self.txt_projection(opt_tokens)
+                            opt_nodes += self.type_embeddings(torch.tensor(2, device=device))
+                            text_nodes.append(opt_nodes)
 
                 all_text_nodes = torch.cat(text_nodes, dim=0)
                 n_txt = all_text_nodes.size(0)
 
-                # 3. 构建多模态图
                 all_nodes = torch.cat([vis_nodes, all_text_nodes], dim=0)
                 total_nodes = n_vis + n_txt
 
-                full_adj = torch.full((total_nodes, total_nodes), 14, dtype=torch.long, device=device)
+                full_adj = torch.full((total_nodes, total_nodes), 14, dtype=torch.long, device=device)  # T-T Global
                 full_adj[:n_vis, :n_vis] = vis_adj
-                full_adj[:n_vis, n_vis:] = 13  # V-T
-                full_adj[n_vis:, :n_vis] = 13  # T-V
+                full_adj[:n_vis, n_vis:] = 13  # V-T Implicit
+                full_adj[n_vis:, :n_vis] = 13  # T-V Implicit
 
-                # 4. 空间感知编码 (深度融合)
                 encoded_nodes = self.spatial_encoder(
                     all_nodes.unsqueeze(0),
                     full_adj.unsqueeze(0)
                 ).squeeze(0)
 
-                # 5. 提取增强后的特征
                 vis_nodes_new = encoded_nodes[:n_vis]
-                # 提取更新后的 [CLS] 节点 (它是 text_nodes 的第0个，即 encoded_nodes 的第 n_vis 个)
-                q_final_updated = encoded_nodes[n_vis]  # [1024]
+                # --- 修复 Query 来源 ---
+                # q_final_updated 是更新后的 [CLS] 节点 (它在 all_text_nodes 的第0个)
+                q_final_updated = encoded_nodes[n_vis]
 
-                # 6. BUTD Fusion (使用更新后的 Query 和 Context)
                 q_expanded = q_final_updated.unsqueeze(0).repeat(n_vis, 1)
                 att_in = torch.cat([vis_nodes_new, q_expanded], dim=1)
 
@@ -467,7 +475,7 @@ class SpatiallyAwareISAAQ(nn.Module):
 
 
 # -----------------------------------------------------------------
-# 训练流程函数
+# 训练流程函数 (包含被遗漏的函数)
 # -----------------------------------------------------------------
 
 def get_data_tf(split, retrieval_solver, tokenizer, max_len):
@@ -510,11 +518,22 @@ def get_data_ndq(dataset_name, split, retrieval_solver, tokenizer, max_len):
 
 
 def process_data_ndq(raw_data, batch_size, split):
-    input_ids_list, att_mask_list, labels_list = raw_data
-    inputs = torch.tensor(input_ids_list)
-    masks = torch.tensor(att_mask_list)
-    labels = torch.tensor(labels_list)
-    data = TensorDataset(inputs, masks, labels)
+    # raw_data MIGHT include token_type_ids, adjust if necessary
+    if len(raw_data) == 3:
+        input_ids_list, att_mask_list, labels_list = raw_data
+        inputs = torch.tensor(input_ids_list)
+        masks = torch.tensor(att_mask_list)
+        labels = torch.tensor(labels_list)
+        data = TensorDataset(inputs, masks, labels)
+    else:
+        # Assuming format [ids, mask, types, labels] or similar
+        # This part might need adjustment based on what get_data_ndq returns
+        input_ids_list, att_mask_list, *_, labels_list = raw_data
+        inputs = torch.tensor(input_ids_list)
+        masks = torch.tensor(att_mask_list)
+        labels = torch.tensor(labels_list)
+        data = TensorDataset(inputs, masks, labels)  # 简化版，ensembler 可能不需要 types
+
     if split == "train":
         sampler = RandomSampler(data)
         dataloader = DataLoader(data, sampler=sampler, batch_size=batch_size)
@@ -585,6 +604,9 @@ def get_data_dq(split, retrieval_solver, tokenizer, max_len):
             tokens = tokens + [tokenizer.pad_token_id] * (MAX_OCR_LEN - len(tokens))
             current_ocr_ids.append(tokens)
 
+        # 截断 OCR 坐标列表以匹配 tokenized 的文本
+        ocr_coords = ocr_coords[:len(current_ocr_ids)]
+
         if len(current_ocr_ids) == 0:
             ocr_ids_tensor = torch.zeros(1, MAX_OCR_LEN, dtype=torch.long)
         else:
@@ -610,6 +632,148 @@ def get_data_dq(split, retrieval_solver, tokenizer, max_len):
     return [input_ids_list, att_mask_list, token_type_list, images_list, obj_coords_list, ocr_coords_list,
             ocr_input_ids_list, spatial_adj_matrix_list, labels_list]
 
+
+def get_data_dq_bd(split, retrieval_solver, tokenizer, max_len):
+    input_ids_list, att_mask_list = [], []
+    images1_list, images2_list, coords_list, labels_list = [], [], [], []
+    json_path = os.path.join("jsons", "tqa_dq_bd.json")
+    if not os.path.exists(json_path): return [], [], [], [], [], []
+    with open(json_path, "r", encoding="utf-8", errors="surrogatepass") as file:
+        dataset = json.load(file)
+    dataset = [doc for doc in dataset if doc["split"] == split]
+    for doc in tqdm(dataset):
+        question = doc["question"]
+        text = doc["paragraph_" + retrieval_solver]
+        answers = list(doc["answers"].values())
+        input_ids_q, att_mask_q = [], []
+        for count_i in range(4):
+            answer = answers[count_i] if count_i < len(answers) else ""
+            ids, mask = get_choice_encoded(text, question, answer, max_len, tokenizer)
+            input_ids_q.append(ids)
+            att_mask_q.append(mask)
+        input_ids_list.append(input_ids_q)
+        att_mask_list.append(att_mask_q)
+        images1_list.append(doc["image_path"])
+        images2_list.append(doc["context_image_path"])
+        coords_list.append([c[:4] for c in doc["coords"]])
+        labels_list.append(list(doc["answers"].keys()).index(doc["correct_answer"]))
+    return [input_ids_list, att_mask_list, images1_list, images2_list, coords_list, labels_list]
+
+
+def training_tf(model, train_dataloader, val_dataloader, optimizer, scheduler, epochs, retrieval_solver, device,
+                save_model=False):
+    for epoch_i in range(epochs):
+        print(f'\nEpoch {epoch_i + 1}/{epochs} Training...')
+        model.train()
+        total_points, total_errors = 0, 0
+        loss_accum = []
+        for batch in tqdm(train_dataloader):
+            batch = tuple(t.to(device) for t in batch)
+            b_ids, b_mask, b_lbls = batch
+            outputs = model(b_ids, attention_mask=b_mask, labels=b_lbls)
+            loss, logits = outputs
+
+            preds = logits.detach().cpu().numpy()
+            lbls = b_lbls.cpu().numpy()
+            p, e = flat_accuracy(preds, lbls)
+            total_points += p;
+            total_errors += e
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            model.zero_grad()
+            loss_accum.append(loss.item())
+
+        if save_model:
+            torch.save(model.state_dict(), f"checkpoints/tf_roberta_{retrieval_solver}_e{epoch_i + 1}.pth")
+        validation_tf(model, val_dataloader, device)
+
+
+def validation_tf(model, val_dataloader, device):
+    print("Running Validation...")
+    model.eval()
+    total_points, total_errors = 0, 0
+    loss_list = []
+    final_res = []  # --- 修复：返回 logits ---
+    for batch in tqdm(val_dataloader):
+        batch = tuple(t.to(device) for t in batch)
+        b_ids, b_mask, b_lbls = batch
+        with torch.no_grad():
+            outputs = model(b_ids, attention_mask=b_mask, labels=b_lbls)
+        loss, logits = outputs
+        loss_list.append(loss.item())
+        preds = logits.detach().cpu().numpy()
+        for l in preds: final_res.append(l)  # --- 修复：填充 logits ---
+        lbls = b_lbls.cpu().numpy()
+        p, e = flat_accuracy(preds, lbls)
+        total_points += p;
+        total_errors += e
+
+    acc = total_points / (total_points + total_errors + 1e-9)
+    print(f"Val Acc: {acc:.4f} Loss: {np.mean(loss_list):.4f}")
+    return final_res  # --- 修复：返回 logits ---
+
+
+def training_ndq(model, train_dataloader, val_dataloader, optimizer, scheduler, epochs, retrieval_solver, device,
+                 save_model, dataset_name):
+    for epoch_i in range(epochs):
+        print(f'\nEpoch {epoch_i + 1}/{epochs} Training...')
+        model.train()
+        total_points, total_errors = 0, 0
+        loss_accum = []
+        for batch in tqdm(train_dataloader):
+            batch = tuple(t.to(device) for t in batch)
+            b_ids, b_mask, b_lbls = batch
+            outputs = model(b_ids, attention_mask=b_mask, labels=b_lbls)
+            loss, logits = outputs
+            preds = logits.detach().cpu().numpy()
+            lbls = b_lbls.cpu().numpy()
+            p, e = flat_accuracy(preds, lbls)
+            total_points += p;
+            total_errors += e
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            model.zero_grad()
+            loss_accum.append(loss.item())
+
+        if save_model:
+            torch.save(model.state_dict(),
+                       f"checkpoints/tmc_{dataset_name}_roberta_{retrieval_solver}_e{epoch_i + 1}.pth")
+        validation_ndq(model, val_dataloader, device)
+
+
+# --- 重新添加 validation_ndq ---
+def validation_ndq(model, val_dataloader, device):
+    print("Running Validation...")
+    model.eval()
+    total_points, total_errors = 0, 0
+    loss_list = []
+    final_res = []  # --- 修复：返回 logits ---
+    for batch in tqdm(val_dataloader):
+        batch = tuple(t.to(device) for t in batch)
+        b_ids, b_mask, b_lbls = batch
+        with torch.no_grad():
+            outputs = model(b_ids, attention_mask=b_mask, labels=b_lbls)
+        loss, logits = outputs
+        loss_list.append(loss.item())
+        preds = logits.detach().cpu().numpy()
+        for l in preds: final_res.append(l)  # --- 修复：填充 logits ---
+        lbls = b_lbls.cpu().numpy()
+        p, e = flat_accuracy(preds, lbls)
+        total_points += p;
+        total_errors += e
+
+    acc = total_points / (total_points + total_errors + 1e-9)
+    print(f"Val Acc: {acc:.4f} Loss: {np.mean(loss_list):.4f}")
+    return final_res  # --- 修复：返回 logits ---
+
+
+# --- 结束重新添加 ---
 
 def training_dq(model, raw_data_train, raw_data_val, optimizer, scheduler, epochs, batch_size, retrieval_solver, device,
                 save_model):
@@ -638,8 +802,10 @@ def training_dq(model, raw_data_train, raw_data_val, optimizer, scheduler, epoch
 
             # Pad OCR IDs
             batch_ocr_ids_list = [ocr_ids[k] for k in batch_idx]
-            max_nodes = max([t.size(0) for t in batch_ocr_ids_list])
-            padded_ocr_ids = torch.zeros(len(batch_idx), max_nodes, 10, dtype=torch.long).to(device)
+            # 找到批次中最大的 OCR 节点数 (确保不为空)
+            max_nodes = max([t.size(0) for t in batch_ocr_ids_list if t.size(0) > 0] + [1])
+            padded_ocr_ids = torch.zeros(len(batch_idx), max_nodes, 10, dtype=torch.long).to(
+                device)  # 10 is MAX_OCR_LEN
             for j, t in enumerate(batch_ocr_ids_list):
                 padded_ocr_ids[j, :t.size(0), :] = t.to(device)
 
@@ -680,12 +846,14 @@ def validation_dq(model, raw_data_val, batch_size, device):
     model.eval()
     total_points, total_errors = 0, 0
     loss_list = []
+    final_res = []  # --- 修复：返回 logits ---
+
     indices = list(range(len(labels)))
     for i in tqdm(range(0, len(indices), batch_size)):
         batch_idx = indices[i:i + batch_size]
 
         batch_ocr_ids_list = [ocr_ids[k] for k in batch_idx]
-        max_nodes = max([t.size(0) for t in batch_ocr_ids_list])
+        max_nodes = max([t.size(0) for t in batch_ocr_ids_list if t.size(0) > 0] + [1])
         padded_ocr_ids = torch.zeros(len(batch_idx), max_nodes, 10, dtype=torch.long).to(device)
         for j, t in enumerate(batch_ocr_ids_list): padded_ocr_ids[j, :t.size(0), :] = t.to(device)
 
@@ -703,9 +871,12 @@ def validation_dq(model, raw_data_val, batch_size, device):
             )
         loss, logits = outputs
         loss_list.append(loss.item())
-        # --- MODIFICATION: 修复验证集的 flat_accuracy 维度错误 ---
-        preds = logits.detach().cpu().numpy()  # 不要取 [0] !
-        # -------------------------------------------------------
+
+        # --- 修复：AxisError ---
+        preds = logits.detach().cpu().numpy()  # 之前是 logits[0]
+        for l in preds: final_res.append(l)  # --- 修复：填充 logits ---
+        # ------------------------
+
         lbls = torch.tensor([labels[k] for k in batch_idx]).numpy()
         p, e = flat_accuracy(preds, lbls)
         total_points += p;
@@ -713,7 +884,7 @@ def validation_dq(model, raw_data_val, batch_size, device):
 
     acc = total_points / (total_points + total_errors + 1e-9)
     print(f"Val Acc: {acc:.4f} Loss: {np.mean(loss_list):.4f}")
-    return []
+    return final_res  # --- 修复：返回 logits ---
 
 
 def get_data_dq_bd(split, retrieval_solver, tokenizer, max_len):
@@ -786,6 +957,7 @@ def validation_dq_bd(model, raw_data_val, batch_size, device):
     model.eval()
     total_points, total_errors = 0, 0
     loss_list = []
+    final_res = []  # --- 修复：返回 logits ---
     indices = list(range(len(labels_list)))
     for i in tqdm(range(0, len(indices), batch_size)):
         batch_idx = indices[i:i + batch_size]
@@ -799,13 +971,14 @@ def validation_dq_bd(model, raw_data_val, batch_size, device):
         loss, logits = outputs
         loss_list.append(loss.item())
         preds = logits.detach().cpu().numpy()
+        for l in preds: final_res.append(l)  # --- 修复：填充 logits ---
         lbls = b_lbls.cpu().numpy()
         p, e = flat_accuracy(preds, lbls)
         total_points += p;
         total_errors += e
     acc = total_points / (total_points + total_errors + 1e-9)
     print(f"Val Acc: {acc:.4f} Loss: {np.mean(loss_list):.4f}")
-    return []
+    return final_res  # --- 修复：返回 logits ---
 
 
 def generate_interagreement_chart(feats, split):
