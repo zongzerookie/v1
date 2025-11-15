@@ -1,0 +1,1 @@
+The directory paths in ocr_abc_images.py may not correspond to this project structure. This code was originally run in a different project; after copying the resulting JSON file to this project, I also copied ocr_abc_images.py here.
